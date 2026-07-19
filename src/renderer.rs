@@ -62,6 +62,9 @@ pub struct PointLight {
     pub range: f32,
     /// Color premultiplied by intensity.
     pub color: Vec3,
+    /// Source size in world units — 0 is a hard point, larger softens the
+    /// shadow penumbra (approximate area light).
+    pub radius: f32,
 }
 
 #[repr(C)]
@@ -1100,7 +1103,7 @@ fn fs_pt_shadow(in: VOut) -> @location(0) vec4<f32> {
             pt_col: {
                 let mut a = [[0.0f32; 4]; MAX_PT_LIGHTS];
                 for (i, l) in sel.iter().enumerate() {
-                    a[i] = [l.color.x, l.color.y, l.color.z, 0.0];
+                    a[i] = [l.color.x, l.color.y, l.color.z, l.radius];
                 }
                 a
             },

@@ -324,6 +324,16 @@ fn content_tree_stamp() -> u64 {
 }
 
 /// Armor: each point blocks 4% of the wild's damage, capped at 60%.
+/// Soft-shadow source size for the point-light demos (world units). Small
+/// values give a tight penumbra; 0.15 is a nice soft-but-crisp edge. Dev
+/// override: WILDFORGE_LIGHT_RADIUS ("0" = hard point).
+fn demo_light_radius() -> f32 {
+    std::env::var("WILDFORGE_LIGHT_RADIUS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.15)
+}
+
 fn reduced_damage(amount: f32, points: u32) -> f32 {
     amount * (1.0 - (points as f32 * 0.04).min(0.6))
 }
@@ -809,16 +819,19 @@ impl Game {
                 }
             }
             let fy = (y + 2) as f32 + 0.5;
+            let lr = demo_light_radius();
             self.demo_lights = vec![
                 renderer::PointLight {
                     pos: Vec3::new(bx as f32 - 5.0 + 0.5, fy, bz as f32 + 0.5),
                     range: 16.0,
                     color: Vec3::new(0.35, 0.6, 2.0),
+                    radius: lr,
                 },
                 renderer::PointLight {
                     pos: Vec3::new(bx as f32 + 5.0 + 0.5, fy, bz as f32 + 0.5),
                     range: 16.0,
                     color: Vec3::new(2.0, 0.35, 0.3),
+                    radius: lr,
                 },
             ];
         }
@@ -855,6 +868,7 @@ impl Game {
                     pos: Vec3::new(bx as f32 + 0.5, (y + 2) as f32 + 0.5, bz as f32 + 5.5),
                     range: 24.0,
                     color: Vec3::new(2.4, 1.7, 0.8),
+                    radius: demo_light_radius(),
                 }];
             }
         }
