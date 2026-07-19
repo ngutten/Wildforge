@@ -616,6 +616,8 @@ impl Game {
         let spawn = Vec3::new(sx as f32 + 0.5, sy as f32 + 0.2, sz as f32 + 0.5);
 
         self.renderer.chunks.clear();
+
+        self.renderer.invalidate_shadows();
         self.server = server::Server::new(world, 0.3, self.rng ^ 0x5ee1);
         self.player = Player::new(spawn);
         self.spawn_point = spawn;
@@ -1372,6 +1374,7 @@ impl Game {
             self.save_player(); // guest profile under saves/.remote/profile
             self.remote = None;
             self.renderer.chunks.clear();
+            self.renderer.invalidate_shadows();
             self.server = server::Server::new(
                 World::new(0, PathBuf::from("saves/.none"), self.reg.clone()),
                 0.3,
@@ -1391,6 +1394,7 @@ impl Game {
                 .save_kv(&self.server.world.save_dir_for_saving());
         }
         self.renderer.chunks.clear();
+        self.renderer.invalidate_shadows();
         self.server = server::Server::new(
             World::new(0, PathBuf::from("saves/.none"), self.reg.clone()),
             0.3,
@@ -1614,6 +1618,7 @@ impl Game {
                         .collect();
                     self.server = server::Server::new(world, time, 7);
                     self.renderer.chunks.clear();
+                    self.renderer.invalidate_shadows();
                     self.player = Player::new(spawn);
                     self.spawn_point = spawn;
                     self.camera.pos = spawn + Vec3::new(0.0, EYE_HEIGHT, 0.0);

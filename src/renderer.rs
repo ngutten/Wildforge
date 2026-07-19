@@ -231,6 +231,10 @@ pub struct Renderer {
     pt_shadow_depth: wgpu::TextureView,    // shared scratch depth
     pt_face_buf: wgpu::Buffer,             // per-face {view_proj, light_pos}
     pt_face_bg: wgpu::BindGroup,           // dynamic-offset bind of pt_face_buf
+    // Static-light cube cache: a slot is re-rendered only when its light
+    // changes (pos/range) or a block within its range is edited.
+    pt_cache: [Option<(Vec3, f32)>; MAX_PT_LIGHTS],
+    pt_dirty: [bool; MAX_PT_LIGHTS],
 
     outline_buf: wgpu::Buffer,
     crosshair_buf: wgpu::Buffer,
@@ -888,6 +892,8 @@ fn fs_pt_shadow(in: VOut) -> @location(0) vec4<f32> {
             pt_shadow_depth,
             pt_face_buf,
             pt_face_bg,
+            pt_cache: [None; MAX_PT_LIGHTS],
+            pt_dirty: [true; MAX_PT_LIGHTS],
             outline_buf,
             crosshair_buf,
             entity_vbuf,
@@ -994,10 +1000,29 @@ fn fs_pt_shadow(in: VOut) -> @location(0) vec4<f32> {
             water: upload_mesh(&self.device, &mesh.water_verts, &mesh.water_idx),
         };
         self.chunks.insert(pos, gpu);
+        self.invalidate_shadows_near(pos);
     }
 
     pub fn drop_chunk(&mut self, pos: ChunkPos) {
         self.chunks.remove(&pos);
+        self.invalidate_shadows_near(pos);
+    }
+
+    /// Dirty any cached point-shadow cube whose light reaches this chunk.
+    fn invalidate_shadows_near(&mut self, pos: ChunkPos) {
+        for (i, c) in self.pt_cache.iter().enumerate() {
+            if let Some((p, r)) = c {
+                if chunk_in_range(pos, *p, *r) {
+                    self.pt_dirty[i] = true;
+                }
+            }
+        }
+    }
+
+    /// Invalidate every cached point-shadow cube (world reload / bulk clear).
+    pub fn invalidate_shadows(&mut self) {
+        self.pt_dirty = [true; MAX_PT_LIGHTS];
+        self.pt_cache = [None; MAX_PT_LIGHTS];
     }
 
     pub fn render(&mut self, f: FrameInput) -> Result<(), wgpu::SurfaceError> {
@@ -1028,6 +1053,28 @@ fn fs_pt_shadow(in: VOut) -> @location(0) vec4<f32> {
             proj * view
         };
 
+        // N-nearest/brightest point lights get cube shadows + accumulation.
+        let mut sel: Vec<PointLight> = f.point_lights.to_vec();
+        {
+            let cam = f.cam_pos;
+            sel.sort_by(|a, b| {
+                let s = |l: &PointLight| l.pos.distance(cam) - 4.0 * l.color.max_element();
+                s(a).partial_cmp(&s(b)).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            sel.truncate(MAX_PT_LIGHTS);
+        }
+        // Static-light caching: a slot re-renders only when its light changes or
+        // a block in range was edited (invalidate_shadows_near).
+        let mut render_slot = [false; MAX_PT_LIGHTS];
+        for (i, l) in sel.iter().enumerate() {
+            let changed = self.pt_cache[i].is_none_or(|(p, r)| p != l.pos || r != l.range);
+            if changed || self.pt_dirty[i] {
+                render_slot[i] = true;
+                self.pt_cache[i] = Some((l.pos, l.range));
+                self.pt_dirty[i] = false;
+            }
+        }
+
         let uniforms = Uniforms {
             view_proj: f.view_proj.to_cols_array_2d(),
             cam: [f.cam_pos.x, f.cam_pos.y, f.cam_pos.z, f.fog_dist],
@@ -1042,17 +1089,17 @@ fn fs_pt_shadow(in: VOut) -> @location(0) vec4<f32> {
             sun_col: [f.sun_col.x, f.sun_col.y, f.sun_col.z, 0.0],
             amb_col: [f.amb_col.x, f.amb_col.y, f.amb_col.z, 0.0],
             light_vp: light_vp.to_cols_array_2d(),
-            pt_count: [f.point_lights.len().min(MAX_PT_LIGHTS) as u32, 0, 0, 0],
+            pt_count: [sel.len() as u32, 0, 0, 0],
             pt_pos: {
                 let mut a = [[0.0f32; 4]; MAX_PT_LIGHTS];
-                for (i, l) in f.point_lights.iter().take(MAX_PT_LIGHTS).enumerate() {
+                for (i, l) in sel.iter().enumerate() {
                     a[i] = [l.pos.x, l.pos.y, l.pos.z, l.range];
                 }
                 a
             },
             pt_col: {
                 let mut a = [[0.0f32; 4]; MAX_PT_LIGHTS];
-                for (i, l) in f.point_lights.iter().take(MAX_PT_LIGHTS).enumerate() {
+                for (i, l) in sel.iter().enumerate() {
                     a[i] = [l.color.x, l.color.y, l.color.z, 0.0];
                 }
                 a
@@ -1090,14 +1137,16 @@ fn fs_pt_shadow(in: VOut) -> @location(0) vec4<f32> {
         self.queue
             .write_buffer(&self.uniforms_buf, 0, bytemuck::bytes_of(&uniforms));
 
-        // Per-face matrices for the point-shadow cube passes: a 90° perspective
-        // per cube face, plus the light position for the distance write.
-        let n_pt = f.point_lights.len().min(MAX_PT_LIGHTS);
-        if n_pt > 0 {
+        // Per-face matrices for the cube passes (only for slots we re-render
+        // this frame): a 90° perspective per face + the light position.
+        if !sel.is_empty() {
             let stride = PT_FACE_STRIDE as usize;
-            let mut data = vec![0u8; n_pt * 6 * stride];
-            for (li, l) in f.point_lights.iter().take(MAX_PT_LIGHTS).enumerate() {
-                let proj = Mat4::perspective_rh(
+            let mut data = vec![0u8; sel.len() * 6 * stride];
+            for (li, l) in sel.iter().enumerate() {
+                if !render_slot[li] {
+                    continue;
+                }
+                let proj = glam::camera::rh::proj::directx::perspective(
                     std::f32::consts::FRAC_PI_2,
                     1.0,
                     0.1,
@@ -1105,7 +1154,11 @@ fn fs_pt_shadow(in: VOut) -> @location(0) vec4<f32> {
                 );
                 for face in 0..6 {
                     let (dir, up) = CUBE_FACES[face];
-                    let view = Mat4::look_at_rh(l.pos, l.pos + Vec3::from(dir), Vec3::from(up));
+                    let view = glam::camera::rh::view::look_at_mat4(
+                        l.pos,
+                        l.pos + Vec3::from(dir),
+                        Vec3::from(up),
+                    );
                     let vp = (proj * view).to_cols_array();
                     let lp = [l.pos.x, l.pos.y, l.pos.z, 0.0f32];
                     let s = (li * 6 + face) * stride;
@@ -1199,9 +1252,12 @@ fn fs_pt_shadow(in: VOut) -> @location(0) vec4<f32> {
             }
         }
 
-        // Point-light shadow passes: for each active light, render terrain
-        // distance into its 6 cube faces (range-culled to the light's reach).
-        for (li, l) in f.point_lights.iter().take(MAX_PT_LIGHTS).enumerate() {
+        // Point-light shadow passes: re-render only the dirty/changed cubes
+        // (static lights reuse last frame's), range-culled to each light.
+        for (li, l) in sel.iter().enumerate() {
+            if !render_slot[li] {
+                continue;
+            }
             for face in 0..6 {
                 let layer = li * 6 + face;
                 let mut pp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
